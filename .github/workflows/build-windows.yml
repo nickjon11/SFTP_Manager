@@ -1,0 +1,53 @@
+name: Build Windows Client
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          architecture: x64
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install --upgrade pyinstaller-hooks-contrib
+      - name: Check Python source
+        run: python -m compileall -q main.py sftp_manager
+      - name: Build Windows EXE
+        shell: pwsh
+        run: |
+          python -m PyInstaller --clean --noconfirm --onedir --windowed --name "SFTP Manager" --icon "sftp_manager/assets/app.ico" --add-data "sftp_manager/assets;sftp_manager/assets" --collect-all cryptography --collect-all cffi --collect-all paramiko main.py
+          if (!(Test-Path "dist/SFTP Manager/SFTP Manager.exe")) { throw "EXE not found" }
+          if (!(Test-Path "dist/SFTP Manager/_internal")) { throw "Dependencies folder not found" }
+      - name: Package Windows client
+        shell: pwsh
+        run: Compress-Archive -Path "dist/SFTP Manager" -DestinationPath "SFTP_Manager_Windows.zip"
+      - name: Upload downloadable build
+        uses: actions/upload-artifact@v4
+        with:
+          name: SFTP_Manager_Windows
+          path: SFTP_Manager_Windows.zip
+          if-no-files-found: error
+      - name: Publish release for version tags
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: gh release create "${{ github.ref_name }}" "SFTP_Manager_Windows.zip" --title "SFTP Manager ${{ github.ref_name }}" --notes "Windows client build. Extract the ZIP and keep the _internal folder next to SFTP Manager.exe."

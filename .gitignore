@@ -1,0 +1,23 @@
+# Python and local environments
+__pycache__/
+*.py[cod]
+.venv/
+.venv313/
+.env
+
+# Build output
+build/
+dist/
+*.spec
+
+# Local files and credentials
+*.log
+*.pem
+*.key
+known_hosts
+*.ppk
+docker-sftp-data/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
