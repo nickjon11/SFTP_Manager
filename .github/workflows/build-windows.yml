@@ -34,6 +34,18 @@ jobs:
         with:
           python-version: '3.13'
 
+      - name: Prepare application package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ ! -f "sftp_manager/app.py" ] && [ -f "SFTP_Manager/app.py" ]; then
+            cp -R SFTP_Manager sftp_manager
+          fi
+
+          test -f sftp_manager/__init__.py
+          test -f sftp_manager/app.py
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -41,6 +53,10 @@ jobs:
 
       - name: Check Python source
         run: python -m compileall -q main.py sftp_manager
+
+      - name: Verify application imports
+        run: |
+          python -c "import sftp_manager.app; print('Application import successful')"
 
       # Windows
       - name: Build Windows
@@ -83,26 +99,17 @@ jobs:
         run: |
           set -euo pipefail
 
-          PYINSTALLER_ARGS=(
-            --noconfirm
-            --clean
-            --onedir
-            --windowed
-            --name sftp-manager
-            --collect-all cryptography
-            --collect-all cffi
-            --collect-all paramiko
-          )
-
-          if [ -d "sftp_manager/assets" ]; then
-            PYINSTALLER_ARGS+=(
-              --add-data "sftp_manager/assets:sftp_manager/assets"
-            )
-          else
-            echo "::warning::Assets directory missing. Building without bundled assets."
-          fi
-
-          python -m PyInstaller "${PYINSTALLER_ARGS[@]}" main.py
+          python -m PyInstaller \
+            --noconfirm \
+            --clean \
+            --onedir \
+            --windowed \
+            --name sftp-manager \
+            --add-data "sftp_manager/assets:sftp_manager/assets" \
+            --collect-all cryptography \
+            --collect-all cffi \
+            --collect-all paramiko \
+            main.py
 
           test -x dist/sftp-manager/sftp-manager
 
