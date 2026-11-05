@@ -39,12 +39,15 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [ ! -f "sftp_manager/app.py" ] && [ -f "SFTP_Manager/app.py" ]; then
-            cp -R SFTP_Manager sftp_manager
-          fi
+          mkdir -p build_src/sftp_manager
 
-          test -f sftp_manager/__init__.py
-          test -f sftp_manager/app.py
+          cp -R SFTP_Manager/. build_src/sftp_manager/
+          cp main.py build_src/main.py
+
+          test -f build_src/sftp_manager/__init__.py
+          test -f build_src/sftp_manager/app.py
+
+          echo "Application package prepared."
 
       - name: Install Linux GUI libraries
         if: matrix.platform == 'linux'
@@ -69,13 +72,15 @@ jobs:
           python -m pip install -r requirements.txt
 
       - name: Check Python source
-        run: python -m compileall -q main.py sftp_manager
+        run: python -m compileall -q build_src
 
       - name: Verify application imports
         shell: bash
         run: |
           set -euo pipefail
-          export PYTHONPATH="$GITHUB_WORKSPACE${PYTHONPATH:+:$PYTHONPATH}"
+
+          cd build_src
+
           python -c "import sftp_manager.app; print('Application import successful')"
 
       # Windows
@@ -83,13 +88,27 @@ jobs:
         if: matrix.platform == 'windows'
         shell: pwsh
         run: |
-          python -m PyInstaller --noconfirm --clean --onedir --windowed --paths . --name "SFTP Manager" --add-data "sftp_manager/assets;sftp_manager/assets" --collect-all cryptography --collect-all cffi --collect-all paramiko main.py
+          Set-Location build_src
+
+          python -m PyInstaller `
+            --noconfirm `
+            --clean `
+            --onedir `
+            --windowed `
+            --name "SFTP Manager" `
+            --add-data "sftp_manager/assets;sftp_manager/assets" `
+            --collect-all cryptography `
+            --collect-all cffi `
+            --collect-all paramiko `
+            main.py
 
           if (!(Test-Path "dist/SFTP Manager/SFTP Manager.exe")) {
             throw "Windows executable not found"
           }
 
-          Compress-Archive -Path "dist/SFTP Manager" -DestinationPath "SFTP_Manager_v0.8.0_Windows.zip"
+          Compress-Archive `
+            -Path "dist/SFTP Manager" `
+            -DestinationPath "../SFTP_Manager_v0.8.0_Windows.zip"
 
       # macOS Intel
       - name: Build macOS
@@ -98,12 +117,13 @@ jobs:
         run: |
           set -euo pipefail
 
+          cd build_src
+
           python -m PyInstaller \
             --noconfirm \
             --clean \
             --onedir \
             --windowed \
-            --paths . \
             --name "SFTP Manager" \
             --add-data "sftp_manager/assets:sftp_manager/assets" \
             --collect-all cryptography \
@@ -121,7 +141,7 @@ jobs:
             -volname "SFTP Manager" \
             -srcfolder dmg-content \
             -format UDZO \
-            "SFTP_Manager_v0.8.0_macOS_Intel.dmg"
+            "../SFTP_Manager_v0.8.0_macOS_Intel.dmg"
 
       # Debian / Ubuntu x86-64
       - name: Build Debian package
@@ -130,12 +150,13 @@ jobs:
         run: |
           set -euo pipefail
 
+          cd build_src
+
           python -m PyInstaller \
             --noconfirm \
             --clean \
             --onedir \
             --windowed \
-            --paths . \
             --name sftp-manager \
             --add-data "sftp_manager/assets:sftp_manager/assets" \
             --collect-all cryptography \
@@ -180,7 +201,7 @@ jobs:
           EOF
 
           dpkg-deb --build --root-owner-group \
-            pkg SFTP_Manager_v0.8.0_Linux_amd64.deb
+            pkg ../SFTP_Manager_v0.8.0_Linux_amd64.deb
 
       # Upload Windows artifact
       - name: Upload Windows
