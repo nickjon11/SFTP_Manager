@@ -8,7 +8,7 @@ on:
     tags: ['v*']
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -22,12 +22,15 @@ jobs:
             platform: macos
           - os: ubuntu-24.04
             platform: linux
+
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.13'
 
@@ -36,56 +39,132 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
 
-      - name: Check source
+      - name: Check Python source
         run: python -m compileall -q main.py sftp_manager
 
+      # Windows
       - name: Build Windows
         if: matrix.platform == 'windows'
         shell: pwsh
         run: |
           python -m PyInstaller --noconfirm --clean --onedir --windowed --name "SFTP Manager" --add-data "sftp_manager/assets;sftp_manager/assets" --collect-all cryptography --collect-all cffi --collect-all paramiko main.py
+
+          if (!(Test-Path "dist/SFTP Manager/SFTP Manager.exe")) {
+            throw "Windows executable not found"
+          }
+
           Compress-Archive -Path "dist/SFTP Manager" -DestinationPath "SFTP_Manager_v0.8.0_Windows.zip"
 
+      # macOS Intel
       - name: Build macOS
         if: matrix.platform == 'macos'
+        shell: bash
         run: |
+          set -euo pipefail
+
           python -m PyInstaller --noconfirm --clean --onedir --windowed --name "SFTP Manager" --add-data "sftp_manager/assets:sftp_manager/assets" --collect-all cryptography --collect-all cffi --collect-all paramiko main.py
+
           test -d "dist/SFTP Manager.app"
-          mkdir dmg-content
+
+          mkdir -p dmg-content
           cp -R "dist/SFTP Manager.app" dmg-content/
           ln -s /Applications dmg-content/Applications
-          hdiutil create -volname "SFTP Manager" -srcfolder dmg-content -format UDZO "SFTP_Manager_v0.8.0_macOS_Intel.dmg"
 
+          hdiutil create \
+            -volname "SFTP Manager" \
+            -srcfolder dmg-content \
+            -format UDZO \
+            "SFTP_Manager_v0.8.0_macOS_Intel.dmg"
+
+      # Debian / Ubuntu x86-64
       - name: Build Debian package
         if: matrix.platform == 'linux'
+        shell: bash
         run: |
-          python -m PyInstaller --noconfirm --clean --onedir --windowed --name sftp-manager --add-data "sftp_manager/assets:sftp_manager/assets" --collect-all cryptography --collect-all cffi --collect-all paramiko main.py
-          mkdir -p pkg/DEBIAN pkg/opt/sftp-manager pkg/usr/bin pkg/usr/share/applications
-          cp -a dist/sftp-manager/. pkg/opt/sftp-manager/
-          printf 'Package: sftp-manager\nVersion: 0.8.0\nSection: net\nPriority: optional\nArchitecture: amd64\nMaintainer: IT610 Project\nDescription: SFTP Manager desktop client\n' > pkg/DEBIAN/control
-          printf '#!/bin/sh\nexec /opt/sftp-manager/sftp-manager "$@"\n' > pkg/usr/bin/sftp-manager
-          chmod +x pkg/usr/bin/sftp-manager
-          printf '[Desktop Entry]\nType=Application\nName=SFTP Manager\nExec=/usr/bin/sftp-manager\nTerminal=false\nCategories=Network;FileTransfer;\n' > pkg/usr/share/applications/sftp-manager.desktop
-          dpkg-deb --build --root-owner-group pkg SFTP_Manager_v0.8.0_Linux_amd64.deb
+          set -euo pipefail
 
+          PYINSTALLER_ARGS=(
+            --noconfirm
+            --clean
+            --onedir
+            --windowed
+            --name sftp-manager
+            --collect-all cryptography
+            --collect-all cffi
+            --collect-all paramiko
+          )
+
+          if [ -d "sftp_manager/assets" ]; then
+            PYINSTALLER_ARGS+=(
+              --add-data "sftp_manager/assets:sftp_manager/assets"
+            )
+          else
+            echo "::warning::Assets directory missing. Building without bundled assets."
+          fi
+
+          python -m PyInstaller "${PYINSTALLER_ARGS[@]}" main.py
+
+          test -x dist/sftp-manager/sftp-manager
+
+          mkdir -p pkg/DEBIAN
+          mkdir -p pkg/opt/sftp-manager
+          mkdir -p pkg/usr/bin
+          mkdir -p pkg/usr/share/applications
+
+          cp -a dist/sftp-manager/. pkg/opt/sftp-manager/
+
+          cat > pkg/DEBIAN/control <<'EOF'
+          Package: sftp-manager
+          Version: 0.8.0
+          Section: net
+          Priority: optional
+          Architecture: amd64
+          Maintainer: IT610 Project <nickjon11@users.noreply.github.com>
+          Description: SFTP Manager desktop SSH and SFTP client
+          EOF
+
+          cat > pkg/usr/bin/sftp-manager <<'EOF'
+          #!/bin/sh
+          exec /opt/sftp-manager/sftp-manager "$@"
+          EOF
+
+          chmod 755 pkg/usr/bin/sftp-manager
+
+          cat > pkg/usr/share/applications/sftp-manager.desktop <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=SFTP Manager
+          Exec=/usr/bin/sftp-manager
+          Terminal=false
+          Categories=Network;FileTransfer;
+          EOF
+
+          dpkg-deb --build --root-owner-group \
+            pkg SFTP_Manager_v0.8.0_Linux_amd64.deb
+
+      # Upload Windows artifact
       - name: Upload Windows
         if: matrix.platform == 'windows'
         uses: actions/upload-artifact@v4
         with:
           name: windows-client
           path: SFTP_Manager_v0.8.0_Windows.zip
+          if-no-files-found: error
 
+      # Upload macOS artifact
       - name: Upload macOS
         if: matrix.platform == 'macos'
         uses: actions/upload-artifact@v4
         with:
           name: macos-client
           path: SFTP_Manager_v0.8.0_macOS_Intel.dmg
+          if-no-files-found: error
 
+      # Upload Linux artifact
       - name: Upload Linux
         if: matrix.platform == 'linux'
         uses: actions/upload-artifact@v4
         with:
           name: linux-client
           path: SFTP_Manager_v0.8.0_Linux_amd64.deb
-
+          if-no-files-found: error
