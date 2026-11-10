@@ -1,0 +1,1 @@
+Original v0.8.1.4 with only Docker workspace resolution warning added. Trigger: page below 1000x650 logical pixels. Restore on resize. Run original v0.8.1.4 BAT launcher.

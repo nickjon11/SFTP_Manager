@@ -1,0 +1,1 @@
+v0.8.2: Moved Docker Quick Start / Help into a compact Help button next to Test connection. Existing lighter-blue fix retained.

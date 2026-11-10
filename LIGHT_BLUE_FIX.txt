@@ -1,0 +1,1 @@
+v0.8.2 light-mode Docker alternate rows: #7398D0 (was dark navy). Dark mode and all other styling unchanged.

@@ -11,16 +11,19 @@ import re
 import shlex
 import subprocess
 import shutil
+import socket
+import ipaddress
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import deque
 from .terminal_view import TerminalView
 import paramiko
 from PySide6.QtWidgets import QDialog, QFormLayout, QDialogButtonBox, QFileDialog, QInputDialog
 from pathlib import Path
-from PySide6.QtCore import Qt, QSize, QTimer, QDateTime, QThread, Signal, QSettings, QProcess
+from PySide6.QtCore import Qt, QSize, QEvent, QTimer, QDateTime, QThread, Signal, QSettings, QProcess
 from PySide6.QtGui import QAction, QIcon, QMovie, QFont, QPainter, QColor, QPen, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
  QLabel, QPushButton, QFrame, QStackedWidget, QTableWidget, QTableWidgetItem,
- QHeaderView, QMessageBox, QLineEdit, QAbstractItemView, QCheckBox, QProgressBar, QComboBox, QTextBrowser, QPlainTextEdit, QTabWidget, QGroupBox, QSpinBox, QScrollArea, QSplitter, QGridLayout, QSizePolicy, QTextEdit, QToolButton)
+ QHeaderView, QMessageBox, QLineEdit, QAbstractItemView, QCheckBox, QProgressBar, QComboBox, QTextBrowser, QPlainTextEdit, QTabWidget, QGroupBox, QSpinBox, QScrollArea, QSplitter, QGridLayout, QSizePolicy, QTextEdit, QToolButton, QLayout)
 
 
 HERE = Path(__file__).resolve().parent
@@ -44,6 +47,59 @@ class ConfirmHostKeyPolicy(paramiko.MissingHostKeyPolicy):
         known=Path.home()/'.ssh'/'known_hosts'
         known.parent.mkdir(parents=True,exist_ok=True)
         client.save_host_keys(str(known))
+
+
+class SSHDiscoveryWorker(QThread):
+    """Bounded TCP reachability check for SSH services on the local IPv4 /24."""
+    found = Signal(str, str, int)
+    completed = Signal(str)
+
+    def __init__(self, port=22, parent=None):
+        super().__init__(parent)
+        self.port = port
+        self._cancelled = False
+
+    def stop(self):
+        self._cancelled = True
+
+    def run(self):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.connect(('192.0.2.1', 80))  # UDP route lookup; no packet sent
+                local_ip = sock.getsockname()[0]
+            network = ipaddress.ip_network(local_ip + '/24', strict=False)
+            addresses = [str(ip) for ip in network.hosts() if str(ip) != local_ip]
+            addresses.insert(0, local_ip)
+            def probe(ip):
+                if self._cancelled:
+                    return None
+                try:
+                    with socket.create_connection((ip, self.port), timeout=0.4) as conn:
+                        conn.settimeout(0.5)
+                        try:
+                            banner = conn.recv(128)
+                        except (socket.timeout, OSError):
+                            banner = b''
+                        if banner and not banner.startswith(b'SSH-'):
+                            return None
+                    try:
+                        name = socket.gethostbyaddr(ip)[0]
+                    except (socket.herror, socket.gaierror, OSError):
+                        name = 'SSH server'
+                    return name, ip, self.port
+                except OSError:
+                    return None
+            with ThreadPoolExecutor(max_workers=24) as pool:
+                futures = [pool.submit(probe, ip) for ip in addresses]
+                for future in as_completed(futures):
+                    if self._cancelled:
+                        break
+                    result = future.result()
+                    if result:
+                        self.found.emit(*result)
+            self.completed.emit('Scan cancelled.' if self._cancelled else 'Scan complete.')
+        except Exception as exc:
+            self.completed.emit(f'Scan unavailable: {exc}')
 
 
 class NetworkGraph(QWidget):
@@ -308,7 +364,7 @@ class Manager(QMainWindow):
         self.remote_entries = []
         self.transfer_history = []
         self.connect_worker = None
-        self.setWindowTitle('SFTP Manager v0.8.0 — SFTP Client')
+        self.setWindowTitle('SFTP Manager v0.8.2 — SFTP Client')
         self.setWindowIcon(QIcon(str(ASSETS / 'app.ico')))
         self.resize(1440, 900)
         self.setMinimumSize(900, 640)
@@ -324,7 +380,7 @@ class Manager(QMainWindow):
         outer = QVBoxLayout(center)
         outer.setContentsMargins(5, 5, 5, 5)
         outer.setSpacing(5)
-        self.banner = QLabel('  SFTP MANAGER     /     SFTP CLIENT v0.8.0')
+        self.banner = QLabel('  SFTP MANAGER     /     SFTP CLIENT v0.8.2')
         self.banner.setObjectName('banner')
         self.banner.setMinimumHeight(36)
         outer.addWidget(self.banner)
@@ -788,20 +844,152 @@ class Manager(QMainWindow):
             return
         dlg = QDialog(self)
         dlg.setWindowTitle('Connect to SFTP Server')
-        form = QFormLayout(dlg)
+        dlg.resize(900, 420)
+        outer = QVBoxLayout(dlg)
+        columns = QHBoxLayout()
+        outer.addLayout(columns, 1)
+
+        left = QWidget(dlg)
+        form = QFormLayout(left)
         host = QLineEdit(self.preferences.value('host','127.0.0.1'))
-        port = QLineEdit(self.preferences.value('port','2222'))
+        port = QLineEdit(self.preferences.value('port','22'))
         username = QLineEdit(self.preferences.value('username','virtual11'))
         password = QLineEdit()
         password.setEchoMode(QLineEdit.EchoMode.Password)
         for label, widget in [('Host / IP',host),('Port',port),('Username',username),('Password',password)]:
             form.addRow(label,widget)
-        note=QLabel('VirtualBox NAT example: 127.0.0.1 : 2222\nThe server fingerprint must be approved on first connection.')
+        note = QLabel('VirtualBox NAT example: 127.0.0.1 : 2222\nThe server fingerprint must be approved on first connection.')
+        note.setWordWrap(True)
         form.addRow(note)
-        buttons=QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.accepted.connect(dlg.accept)
+        # Reuse the application's existing globe GIF as the discovery activity indicator.
+        globe_footer = QHBoxLayout()
+        discovery_globe = QLabel(left)
+        discovery_globe.setFixedSize(48, 48)
+        discovery_globe.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        discovery_movie = QMovie(str(ASSETS / 'globe.gif'), parent=dlg)
+        discovery_movie.setScaledSize(QSize(40, 40))
+        discovery_globe.setMovie(discovery_movie)
+        discovery_movie.start()
+        discovery_movie.setPaused(True)
+        discovery_globe_text = QLabel('Ready to scan', left)
+        discovery_globe_text.setWordWrap(True)
+        globe_footer.addWidget(discovery_globe)
+        globe_footer.addWidget(discovery_globe_text, 1)
+        form.addRow(globe_footer)
+        columns.addWidget(left, 2)
+
+        right = QGroupBox('Network Discovery', dlg)
+        discovery_layout = QVBoxLayout(right)
+        discovery_layout.addWidget(QLabel('Find reachable SSH/SFTP servers on your local network.'))
+        scan_row = QHBoxLayout()
+        scan_button = QPushButton('Scan Network')
+        refresh_button = QPushButton('Refresh')
+        scan_port = QSpinBox()
+        scan_port.setRange(1, 65535)
+        scan_port.setValue(22)
+        scan_port.setPrefix('Port: ')
+        scan_row.addWidget(scan_button)
+        scan_row.addWidget(refresh_button)
+        scan_row.addWidget(scan_port)
+        discovery_layout.addLayout(scan_row)
+        results = QTableWidget(0, 4)
+        results.setHorizontalHeaderLabels(['Device / Hostname', 'IP Address', 'Port', 'Status'])
+        results.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        results.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        results.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        results.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        results.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        results.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        results.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        discovery_layout.addWidget(results, 1)
+        discovery_footer = QHBoxLayout()
+        scan_status = QLabel('Select Scan Network to search your local /24 subnet.')
+        scan_status.setWordWrap(True)
+        use_selected = QPushButton('Use Selected')
+        use_selected.setEnabled(False)
+        discovery_footer.addWidget(scan_status, 1)
+        discovery_footer.addWidget(use_selected)
+        discovery_layout.addLayout(discovery_footer)
+        columns.addWidget(right, 3)
+
+        worker_holder = {'worker': None}
+        def add_result(name, ip, ssh_port):
+            row = results.rowCount()
+            results.insertRow(row)
+            for col, value in enumerate((name, ip, str(ssh_port), 'SSH Available')):
+                results.setItem(row, col, QTableWidgetItem(value))
+            scan_status.setText(f'{results.rowCount()} reachable SSH server(s) found.')
+
+        def scan_done(message):
+            scan_button.setEnabled(True)
+            refresh_button.setEnabled(True)
+            scan_status.setText(f'{message} {results.rowCount()} server(s) found.')
+            discovery_movie.setPaused(True)
+            discovery_globe_text.setText(f'{message}\n{results.rowCount()} server(s) found.')
+
+        def start_scan():
+            worker = worker_holder['worker']
+            if worker is not None and worker.isRunning():
+                return
+            results.setRowCount(0)
+            use_selected.setEnabled(False)
+            scan_button.setEnabled(False)
+            refresh_button.setEnabled(False)
+            scan_status.setText('Scanning local network...')
+            discovery_globe_text.setText('Scanning local network...\nSearching for SSH/SFTP servers...')
+            discovery_movie.start()
+            discovery_movie.setPaused(False)
+            worker = SSHDiscoveryWorker(scan_port.value(), dlg)
+            worker_holder['worker'] = worker
+            worker.found.connect(add_result)
+            worker.completed.connect(scan_done)
+            worker.start()
+
+        def select_server():
+            row = results.currentRow()
+            if row < 0:
+                return
+            host.setText(results.item(row, 1).text())
+            port.setText(results.item(row, 2).text())
+            host.setFocus()
+
+        scan_button.clicked.connect(start_scan)
+        refresh_button.clicked.connect(start_scan)
+        results.itemSelectionChanged.connect(lambda: use_selected.setEnabled(results.currentRow() >= 0))
+        results.itemDoubleClicked.connect(lambda _item: select_server())
+        use_selected.clicked.connect(select_server)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        def validate_and_accept():
+            required = [('Host / IP', host), ('Port', port), ('Username', username), ('Password', password)]
+            missing = [(name, field) for name, field in required if not field.text().strip()]
+            if missing:
+                QMessageBox.warning(dlg, 'Incomplete Connection Information',
+                    'Please fill in all required connection fields before pressing OK.\n\n'
+                    'Missing: ' + ', '.join(name for name, _ in missing) + '\n\n'
+                    'If you do not wish to connect, select Cancel to close this window.')
+                missing[0][1].setFocus()
+                return
+            try:
+                value = int(port.text().strip())
+                if not 1 <= value <= 65535:
+                    raise ValueError()
+            except ValueError:
+                QMessageBox.warning(dlg, 'Invalid Port', 'Enter a port number between 1 and 65535.')
+                port.setFocus()
+                return
+            dlg.accept()
+        buttons.accepted.connect(validate_and_accept)
         buttons.rejected.connect(dlg.reject)
-        form.addRow(buttons)
+        outer.addWidget(buttons)
+
+        def cleanup_discovery():
+            discovery_movie.setPaused(True)
+            worker = worker_holder['worker']
+            if worker is not None and worker.isRunning():
+                worker.stop()
+                worker.wait(2500)
+        dlg.finished.connect(lambda _code: cleanup_discovery())
         if dlg.exec()!=QDialog.DialogCode.Accepted:return
         try: number=int(port.text())
         except ValueError:
@@ -1125,11 +1313,86 @@ class Manager(QMainWindow):
         except Exception as exc:QMessageBox.warning(self,'Cannot create folder',str(exc))
 
     def show_permissions(self):
-        if not self.require_connection():return
-        name=self.selected_remote()
-        if not name:return
-        entry=next((e for e in self.remote_entries if e.filename==name),None)
-        if entry:QMessageBox.information(self,'File permissions',f'{name}\nUnix permissions: {stat.S_IMODE(entry.st_mode):04o}\nPermissions are read-only in v0.3.0.')
+        if not self.require_connection():
+            return
+        name = self.selected_remote()
+        if not name:
+            QMessageBox.information(self, 'File Permissions', 'Select a remote file or folder first.')
+            return
+        path = posixpath.join(self.remote_path, name)
+        try:
+            entry = self.sftp.stat(path)
+        except Exception as exc:
+            QMessageBox.warning(self, 'Permissions unavailable', str(exc))
+            return
+
+        current = stat.S_IMODE(entry.st_mode)
+        dialog = QDialog(self)
+        dialog.setWindowTitle('File Permissions — ' + name)
+        dialog.setMinimumWidth(410)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel('Remote path: ' + path))
+        layout.addWidget(QLabel('Owner UID: {}    Group GID: {}'.format(
+            getattr(entry, 'st_uid', 'Unknown'), getattr(entry, 'st_gid', 'Unknown'))))
+        layout.addWidget(QLabel('Current Unix permissions: {:04o}'.format(current)))
+        table = QGridLayout()
+        table.setHorizontalSpacing(18)
+        for col, label in enumerate(('Read', 'Write', 'Execute'), 1):
+            table.addWidget(QLabel(label), 0, col)
+        boxes = []
+        for row, (role, shift) in enumerate((('Owner', 6), ('Group', 3), ('Others', 0)), 1):
+            table.addWidget(QLabel(role), row, 0)
+            for col, bit in enumerate((4, 2, 1), 1):
+                cb = QCheckBox()
+                cb.setChecked(bool((current >> shift) & bit))
+                table.addWidget(cb, row, col)
+                boxes.append((cb, shift, bit))
+        layout.addLayout(table)
+        mode_label = QLabel()
+        layout.addWidget(mode_label)
+        def selected_mode():
+            # Preserve special mode bits (setuid, setgid, sticky).
+            value = current & 0o7000
+            for cb, shift, bit in boxes:
+                if cb.isChecked():
+                    value |= bit << shift
+            return value
+        def update_mode():
+            value = selected_mode()
+            mode_label.setText('New permissions: {:04o}    ({})'.format(
+                value, stat.filemode((entry.st_mode & ~0o7777) | value)))
+        for cb, _, _ in boxes:
+            cb.toggled.connect(lambda checked=False: update_mode())
+        update_mode()
+        layout.addWidget(QLabel('Changes use your connected SSH account permissions.'))
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Apply | QDialogButtonBox.StandardButton.Cancel)
+        layout.addWidget(buttons)
+        buttons.rejected.connect(dialog.reject)
+        def apply_changes():
+            new_mode = selected_mode()
+            if new_mode == current:
+                dialog.accept()
+                return
+            if QMessageBox.question(
+                dialog, 'Confirm permission change',
+                'Change permissions for:\\n{}\\n\\n{:04o} → {:04o}?'.format(
+                    path, current, new_mode),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+            ) != QMessageBox.StandardButton.Yes:
+                return
+            try:
+                self.sftp.chmod(path, new_mode)
+                self.record_event('Permissions changed: {} {:04o} -> {:04o}'.format(
+                    path, current, new_mode))
+                self.refresh_remote()
+                dialog.accept()
+            except Exception as exc:
+                self.record_event('Permission change failed: {} ({})'.format(path, exc))
+                QMessageBox.warning(dialog, 'Permission change failed', str(exc))
+        buttons.button(QDialogButtonBox.StandardButton.Apply).clicked.connect(apply_changes)
+        dialog.exec()
 
     def require_connection(self):
         if self.sftp:return True
@@ -1284,6 +1547,19 @@ class Manager(QMainWindow):
         self.docker_connect=QPushButton('Test connection')
         self.docker_connect.clicked.connect(self.docker_test_connection)
         modebar.addWidget(self.docker_connect)
+        help_button=QPushButton('Help')
+        help_button.setToolTip('Docker Quick Start / Help')
+        help_button.setFixedWidth(58)
+        help_button.clicked.connect(lambda:QMessageBox.information(
+            self,'Docker quick start',
+            '1. Connect to your Debian SSH server.\n'
+            '2. Click Refresh to list containers.\n'
+            '3. Select a container in the table.\n'
+            '4. Start, Stop, Restart, Logs, Inspect and Stats act on that selection.\n'
+            '5. Double-click a row to view its logs.\n'
+            '6. Use Docker Compose and Volumes tabs for additional tools.\n\n'
+            'Removing a container requires confirmation.'))
+        modebar.addWidget(help_button)
         self.docker_connection_label=QLabel('Local Docker Desktop: not checked')
         modebar.addWidget(self.docker_connection_label,1)
         lay.addLayout(modebar)
@@ -1297,11 +1573,17 @@ class Manager(QMainWindow):
         self.docker_search.textChanged.connect(self.docker_filter_rows)
         intro.addWidget(self.docker_search)
         lay.addLayout(intro)
-        docker_actions=QHBoxLayout()
+        # Compact, responsive toolbar: keep original text size and wrap when narrow.
+        toolbar=QWidget()
+        self.docker_toolbar_layout=QVBoxLayout(toolbar)
+        self.docker_toolbar_layout.setContentsMargins(2,2,2,2)
+        self.docker_toolbar_layout.setSpacing(5)
+        self.docker_toolbar_buttons=[]
         for label,action in [('Refresh','refresh'),('Start','start'),('Stop','stop'),('Restart','restart'),('Logs','logs'),('Inspect','inspect'),('Stats','stats'),('Create Container','create'),('Docker Compose','compose'),('Remove','remove')]:
             button=QPushButton(label)
-            button.setMinimumHeight(42)
-            button.setMinimumWidth(92)
+            button.setMinimumSize(0,0)
+            button.setSizePolicy(QSizePolicy.Policy.Fixed,QSizePolicy.Policy.Fixed)
+            button.setStyleSheet('padding: 3px 7px; min-height: 0px; min-width: 0px;')
             button.setToolTip({
                 'refresh':'Reload containers', 'start':'Start selected container',
                 'stop':'Stop selected container', 'restart':'Restart selected container',
@@ -1312,19 +1594,9 @@ class Manager(QMainWindow):
             button.clicked.connect(lambda checked=False,a=action:self.docker_action(a))
             if action in ('stop','restart','remove'):
                 button.setToolTip('Changes the selected container; confirmation required')
-            docker_actions.addWidget(button)
-        docker_actions.addStretch()
-        toolbar=QWidget()
-        toolbar.setLayout(docker_actions)
-        toolbar.setMinimumWidth(1110)
-        toolbar_scroll=QScrollArea()
-        toolbar_scroll.setWidgetResizable(True)
-        toolbar_scroll.setWidget(toolbar)
-        toolbar_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        toolbar_scroll.setFixedHeight(67)
-        toolbar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        toolbar_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        lay.addWidget(toolbar_scroll)
+            self.docker_toolbar_buttons.append(button)
+        lay.addWidget(toolbar)
+        self.docker_toolbar_widget=toolbar
 
         self.docker_table=QTableWidget(0,6)
         self.docker_table.setHorizontalHeaderLabels(['Name','Image','State','Status','Ports','Created'])
@@ -1344,18 +1616,6 @@ class Manager(QMainWindow):
         self.docker_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.docker_table.itemSelectionChanged.connect(self.docker_selection_changed)
 
-        help_button=QPushButton('Docker Quick Start / Help')
-        help_button.setMinimumHeight(34)
-        help_button.clicked.connect(lambda:QMessageBox.information(
-            self,'Docker quick start',
-            '1. Connect to your Debian SSH server.\n'
-            '2. Click Refresh to list containers.\n'
-            '3. Select a container in the table.\n'
-            '4. Start, Stop, Restart, Logs, Inspect and Stats act on that selection.\n'
-            '5. Double-click a row to view its logs.\n'
-            '6. Use Docker Compose and Volumes tabs for additional tools.\n\n'
-            'Removing a container requires confirmation.'))
-        lay.addWidget(help_button)
         self.docker_tabs=QTabWidget()
         self.docker_details=QPlainTextEdit()
         self.docker_details.setReadOnly(True)
@@ -1369,15 +1629,19 @@ class Manager(QMainWindow):
         db.addWidget(self.docker_details)
         mg.addWidget(details_box,4)
         action_panel=QGroupBox('Actions')
-        action_grid=QGridLayout(action_panel)
-        action_grid.setContentsMargins(6,8,6,6)
-        for i,(label,action) in enumerate([('Start','start'),('Stop','stop'),('Restart','restart'),('Logs','logs'),('Inspect','inspect'),('Stats','stats'),('Remove Container','remove')]):
+        self.docker_action_grid=QVBoxLayout(action_panel)
+        self.docker_action_grid.setContentsMargins(6,8,6,6)
+        self.docker_action_grid.setSpacing(5)
+        self.docker_action_buttons=[]
+        for label,action in [('Start','start'),('Stop','stop'),('Restart','restart'),('Logs','logs'),('Inspect','inspect'),('Stats','stats'),('Remove Container','remove')]:
             btn=QPushButton(label)
-            btn.setMinimumHeight(43)
-            btn.setMinimumWidth(98)
+            btn.setMinimumSize(0,0)
+            btn.setSizePolicy(QSizePolicy.Policy.Fixed,QSizePolicy.Policy.Fixed)
+            btn.setStyleSheet('padding: 3px 7px; min-height: 0px; min-width: 0px;')
             btn.clicked.connect(lambda checked=False,a=action:self.docker_action(a))
-            action_grid.addWidget(btn,i//2,i%2)
-        action_grid.setRowStretch(4,1)
+            self.docker_action_buttons.append(btn)
+        self.docker_action_panel=action_panel
+        QTimer.singleShot(0,self._layout_compact_buttons)
         mg.addWidget(action_panel,3)
         quick_box=QGroupBox('Quick Commands')
         ql=QVBoxLayout(quick_box)
@@ -1439,6 +1703,31 @@ class Manager(QMainWindow):
         self.docker_note=QLabel('Connect to Debian, then click Refresh.')
         lay.addWidget(self.docker_note)
         self.pages.addWidget(docker)
+        self.docker_page = docker
+        self.docker_resolution_warning = QFrame(docker)
+        self.docker_resolution_warning.setObjectName('dockerResolutionWarning')
+        self.docker_resolution_warning.setStyleSheet("""
+            QFrame#dockerResolutionWarning { background: #171225; border: 1px solid #74639a; }
+            QFrame#dockerResolutionWarning QLabel { color: #f3eaff; background: transparent; }
+        """)
+        warning_layout = QVBoxLayout(self.docker_resolution_warning)
+        warning_layout.setContentsMargins(30, 30, 30, 30)
+        warning_layout.addStretch(1)
+        warning_title = QLabel('Higher Resolution Required')
+        warning_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        warning_title.setStyleSheet('font-size: 21px; font-weight: bold; color: white;')
+        warning_layout.addWidget(warning_title)
+        warning_text = QLabel(
+            'The Docker interface needs more available screen space to display correctly.\n\n'
+            'Enlarge or maximize this window, reduce display scaling, or use a higher-resolution display.\n'
+            'Recommended display resolution: 1280 x 1024 or higher.')
+        warning_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        warning_text.setWordWrap(True)
+        warning_layout.addWidget(warning_text)
+        warning_layout.addStretch(1)
+        self.docker_resolution_warning.hide()
+        docker.installEventFilter(self)
+        QTimer.singleShot(0, self._update_docker_resolution)
         settings,lay=self.page('Settings','Connection, transfers, security, appearance, and logging')
         lay.addWidget(QLabel('CONNECTION'))
         lay.addWidget(QLabel('Saved host, port, and username are reused in the Connect dialog. Passwords are never saved.'))
@@ -1623,7 +1912,7 @@ class Manager(QMainWindow):
         elif name=='Docker':self.change_page(5)
         elif name=='User Management':self.change_page(3)
         elif name=='Transfer Activity':self.change_page(2)
-        elif name=='About SFTP Manager':QMessageBox.about(self,'About SFTP Manager','Secure File Transfer Protocol (SFTP) Manager\nSFTP Manager v0.8.0\nIT610 Project - Jonathan Lachman - 2026\nSFTP Client.')
+        elif name=='About SFTP Manager':QMessageBox.about(self,'About SFTP Manager','Secure File Transfer Protocol (SFTP) Manager\nSFTP Manager v0.8.2\nIT610 Project - Jonathan Lachman - 2026\nSFTP Client.')
         else:self.demo_action(name)
 
     def help_dialog(self,title,body):
@@ -1671,7 +1960,7 @@ class Manager(QMainWindow):
 
     def docker_test_connection(self):
         if self.docker_mode.currentIndex()==2:
-            QMessageBox.information(self,'Docker Hub','Docker Hub authentication is planned, not implemented in v0.8.0.')
+            QMessageBox.information(self,'Docker Hub','Docker Hub authentication is planned, not implemented in v0.8.2.')
             return
         if self.docker_mode.currentIndex()==1 and not self.ssh:
             QMessageBox.information(self,'Remote Docker','Connect to your SSH server first using the main Connect button.')
@@ -1732,6 +2021,87 @@ class Manager(QMainWindow):
             QMessageBox.warning(self,'Invalid command','Command too long or contains line breaks.');return None
         args=['docker','run','-d','--name',n,'--restart','no',img]+(shlex.split(cmd) if cmd else [])
         return ' '.join(shlex.quote(x) for x in args)
+
+    def _layout_compact_buttons(self):
+        """Group buttons at the left; wrap before Inspect at narrower widths."""
+        if not hasattr(self, 'docker_action_buttons'):
+            return
+
+        def arrange(layout, buttons, available, split_at_inspect=False):
+            # Remove old row widgets and return buttons to the layout's parent.
+            while layout.count():
+                item = layout.takeAt(0)
+                widget = item.widget()
+                if widget is not None:
+                    for button in buttons:
+                        if button.parent() is widget:
+                            button.setParent(layout.parentWidget())
+                    widget.deleteLater()
+
+            widths = [button.sizeHint().width() for button in buttons]
+            gap = 5
+            full = sum(widths) + gap * (len(buttons) - 1)
+            groups = [buttons[:4], buttons[4:]] if split_at_inspect and available < full + 12 else [buttons]
+            for group in groups:
+                row_buttons = []
+                used = 0
+                for button in group:
+                    width = button.sizeHint().width()
+                    if row_buttons and used + gap + width > available:
+                        add_row(row_buttons)
+                        row_buttons = []
+                        used = 0
+                    used += (gap if row_buttons else 0) + width
+                    row_buttons.append(button)
+                if row_buttons:
+                    add_row(row_buttons)
+
+            def_unused = None  # Keep the surrounding layout height stable.
+            layout.addStretch(1)
+
+        def add_row(buttons):
+            # Each row gets one stretch AFTER its last button, never between buttons.
+            parent = buttons[0].parentWidget()
+            row_widget = QWidget()
+            row_layout = QHBoxLayout(row_widget)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(5)
+            for button in buttons:
+                row_layout.addWidget(button)
+            row_layout.addStretch(1)
+            active_layout.addWidget(row_widget)
+
+        for active_layout, buttons, available, split in (
+            (self.docker_action_grid, self.docker_action_buttons,
+             max(100, self.docker_action_panel.contentsRect().width()-16), True),
+            (self.docker_toolbar_layout, self.docker_toolbar_buttons,
+             max(100, self.docker_toolbar_widget.contentsRect().width()-8), False),
+        ):
+            arrange(active_layout, buttons, available, split)
+
+    def _update_docker_resolution(self):
+        if not hasattr(self, 'docker_resolution_warning'):
+            return
+        page = self.docker_page
+        warning = self.docker_resolution_warning
+        warning.setGeometry(page.rect())
+        too_small = page.width() < 1000 or page.height() < 650
+        warning.setVisible(too_small and self.pages.currentWidget() is page)
+        if warning.isVisible():
+            warning.raise_()
+
+    def eventFilter(self, watched, event):
+        if (hasattr(self, 'docker_page') and watched is self.docker_page
+                and event.type() in (QEvent.Type.Resize, QEvent.Type.Show)):
+            QTimer.singleShot(0, self._update_docker_resolution)
+        return super().eventFilter(watched, event)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, 'docker_action_buttons'):
+            QTimer.singleShot(0,self._layout_compact_buttons)
+        if hasattr(self, 'docker_resolution_warning'):
+            QTimer.singleShot(0, self._update_docker_resolution)
 
     def docker_action(self, action):
         mode=self.docker_mode.currentIndex()
@@ -1907,6 +2277,8 @@ class Manager(QMainWindow):
 
     def change_page(self,index):
         self.pages.setCurrentIndex(index)
+        if hasattr(self, 'docker_resolution_warning'):
+            QTimer.singleShot(0, self._update_docker_resolution)
         for i,b in enumerate(self.nav_buttons):b.setChecked(i==index)
         self.status.setText(f'{PAGES[index]}  |  ' + ('Connected to SFTP server' if self.sftp else 'Not connected'))
 
@@ -1975,6 +2347,13 @@ class Manager(QMainWindow):
         QCheckBox {padding:8px;}
         """ % (bg,text,surface,border,hover,surface,text,border,select,panel,border,panel,border,entry,border,text,'#c7a3ff' if self.dark else '#380083',surface,text,border,hover,border,select,entry,text,border,surface,text,border,text,border,entry))
 
+        # Light mode: use a softer blue for Docker's alternating rows.
+        # Dark mode retains the original navy-blue appearance.
+        alternate_row_color = '#001b60' if self.dark else '#7398d0'
+        self.setStyleSheet(self.styleSheet() + f'''
+        QTableWidget {{alternate-background-color: {alternate_row_color};}}
+        ''')
+
         header_bg = '#302641' if self.dark else '#d8d6df'
         header_fg = '#f5edff' if self.dark else '#171322'
         card_bg = bg
@@ -1996,10 +2375,17 @@ class Manager(QMainWindow):
         event.accept()
 
     def demo_action(self,name):
-        QMessageBox.information(self,'Feature not available',f'{name} is not implemented in v0.8.0.')
+        QMessageBox.information(self,'Feature not available',f'{name} is not implemented in v0.8.2.')
 
 def main():
+    if sys.platform == 'win32':
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('SFTPManager.Desktop')
+        except (AttributeError, OSError):
+            pass
     app=QApplication(sys.argv)
+    app.setWindowIcon(QIcon(str(ASSETS / 'app.ico')))
     app.setApplicationName('SFTP Manager')
     app.setStyle('Fusion')
     window=Manager()
